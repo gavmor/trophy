@@ -2,15 +2,6 @@
 
 Base:     flat bottom, M20x3 threaded blind hole.
 Cup+stem: flat-top cup rim (print upside-down), M20x3 threaded boss.
-
-Thread strategy per FDM-Friendly-Printable-Threads.md:
-- Trapezoidal profile, no sharp crests
-- ~0.15mm radial clearance between male and female
-- Thread relief gap before mating face to prevent binding
-- Chamfered leads on boss tip and hole entrance
-- Internal thread via subtract-plug pattern (avoids OCCT subtractive-helix bug)
-- Segmented turns: each turn swept at origin, then translated into position
-  (workaround for build123d Helix sweep ignoring center parameter)
 """
 
 from build123d import *
@@ -24,36 +15,33 @@ MALE_R_MIN = 9.0     # core cylinder radius
 MALE_R_MAX = 9.85    # thread crest radius
 
 # Female (base hole) — internal thread
-FEMALE_R_MIN = 9.15  # plug cylinder radius
-FEMALE_R_VALLEY = 10.15   # hole wall / thread valley radius
-FEMALE_R_CREST = FEMALE_R_MIN + (FEMALE_R_VALLEY - FEMALE_R_MIN)
+FEMALE_R_MIN = 9.15  # hole wall radius (minor diameter)
+FEMALE_R_VALLEY = 10.15   # thread valley radius
 
 BOSS_TOP = 14.0      # Z where boss meets stem (mating surface)
 BOSS_BOT = 2.0       # Z where boss tip ends
 THREAD_RELIEF = 1.4  # gap before mating face
 
 
-def _sweep_one_turn(radius, crest_radius, z_offset):
-    """Sweep a single trapezoidal thread turn.
+def _sweep_male_turn(z_offset):
+    """Sweep a single male trapezoidal thread turn.
 
-    The profile is positioned at the exact helix start position using a
-    custom Plane so build123d's sweep correctly aligns it with the path.
-    After sweeping at origin, the result is translated to the target Z.
+    Profile is placed at the exact helix start position using a custom
+    Plane so the sweep correctly aligns it with the path.
     """
+    radius = MALE_R_MIN
+    crest_offset = MALE_R_MAX - radius
     helix = Helix(PITCH, PITCH * 0.95, radius, center=(0, 0, 0))
-    crest_offset = crest_radius - radius
-
-    # Plane at helix start: (radius, 0, 0) with X=radial, Z=axial
     profile_plane = Plane(
         origin=(radius, 0, 0),
         x_dir=(1, 0, 0),
         z_dir=(0, 0, 1),
     )
     pts = [
-        (0, 0.10),
-        (crest_offset, 0.95),
-        (crest_offset, 1.75),
-        (0, 2.60),
+        (0, 0.50),
+        (crest_offset, 1.00),
+        (crest_offset, 2.00),
+        (0, 2.50),
     ]
     with BuildSketch(profile_plane) as sk:
         Polygon(*pts)
@@ -63,32 +51,53 @@ def _sweep_one_turn(radius, crest_radius, z_offset):
     return ridge.moved(Location((0, 0, z_offset)))
 
 
-def _add_external_thread(part, radius, crest_radius, z_start, height):
-    """Fuse external thread ridges onto a cylinder.
+def _sweep_female_plug_turn(z_offset):
+    """Sweep a single female thread cutter plug turn.
 
-    Builds all ridges into a single ring, then fuses the ring with the
-    cylinder. Building the ring first avoids tangent-contact fuse failures
-    between individual turns and the cylinder surface.
+    Core is shrunk by 0.2mm to overhang into hole cavity, guaranteeing
+    a clean boolean subtraction in OCCT. Profile uses custom Plane at
+    the exact helix start position.
     """
+    plug_r = FEMALE_R_MIN - 0.2
+    crest_offset = FEMALE_R_VALLEY - plug_r
+    helix = Helix(PITCH, PITCH * 0.95, plug_r, center=(0, 0, 0))
+    profile_plane = Plane(
+        origin=(plug_r, 0, 0),
+        x_dir=(1, 0, 0),
+        z_dir=(0, 0, 1),
+    )
+    pts = [
+        (0, 0.30),
+        (crest_offset, 0.90),
+        (crest_offset, 2.10),
+        (0, 2.70),
+    ]
+    with BuildSketch(profile_plane) as sk:
+        Polygon(*pts)
+    ridge = sweep(sk.sketch.faces()[0], helix)
+    if not ridge.is_valid:
+        return None
+    return ridge.moved(Location((0, 0, z_offset)))
+
+
+def _add_external_thread(part, z_start, height):
+    """Fuse external thread ridges onto a cylinder."""
     turns = int(height / PITCH) + 1
     ring = None
     for turn in range(turns):
         z = z_start + turn * PITCH
-        ridge = _sweep_one_turn(radius, crest_radius, z)
+        ridge = _sweep_male_turn(z)
         if ridge and ridge.is_valid:
             ring = ridge if ring is None else ring + ridge
-
     if ring and ring.is_valid:
         return part + ring
     return part
 
 
 def _add_internal_thread_plug(base_solid, z_start, height):
-    """Create internal threads by subtracting a threaded plug."""
-    plug_r = FEMALE_R_MIN
-    crest_r = FEMALE_R_CREST
+    """Create internal threads by subtracting an oversized threaded plug."""
+    plug_r = FEMALE_R_MIN - 0.2
 
-    # Build plug cylinder
     with BuildPart() as plug_body:
         Cylinder(radius=plug_r, height=20,
                  align=(Align.CENTER, Align.CENTER, Align.MIN))
@@ -97,7 +106,7 @@ def _add_internal_thread_plug(base_solid, z_start, height):
     turns = int(height / PITCH) + 2
     for turn in range(turns):
         z = z_start + turn * PITCH
-        ridge = _sweep_one_turn(plug_r, crest_r, z)
+        ridge = _sweep_female_plug_turn(z)
         if ridge:
             plug = plug + ridge
 
@@ -105,7 +114,7 @@ def _add_internal_thread_plug(base_solid, z_start, height):
 
 
 def gen_base():
-    """Base — smooth hole, subtract threaded plug for internal threads."""
+    """Base — smooth hole at FEMALE_R_MIN, subtract threaded plug."""
     with BuildPart() as body:
         with BuildSketch(Plane.XZ) as profile:
             with BuildLine() as outline:
@@ -115,9 +124,9 @@ def gen_base():
                 l4  = Line(l3 @ 1,    (26, BOSS_TOP))
                 # Chamfer at hole entrance
                 l5  = Line(l4 @ 1,    (FEMALE_R_VALLEY + 1.0, BOSS_TOP))
-                l6  = Line(l5 @ 1,    (FEMALE_R_VALLEY, BOSS_TOP - 1.0))
-                # Hole wall
-                l7  = Line(l6 @ 1,    (FEMALE_R_VALLEY, BOSS_BOT - 0.5))
+                l6  = Line(l5 @ 1,    (FEMALE_R_MIN, BOSS_TOP - 1.0))
+                # Hole wall at FEMALE_R_MIN (narrow core, not valley)
+                l7  = Line(l6 @ 1,    (FEMALE_R_MIN, BOSS_BOT - 0.5))
                 l8  = Line(l7 @ 1,    (0, BOSS_BOT - 0.5))
                 l9  = Line(l8 @ 1,    (0, 0))
             make_face()
@@ -166,9 +175,8 @@ def gen_cup_stem():
             make_face()
         revolve(axis=Axis.Z, revolution_arc=360)
 
-    # Fuse external thread, ending early for relief
     return _add_external_thread(
-        body.part, MALE_R_MIN, MALE_R_MAX,
+        body.part,
         BOSS_BOT + 0.5,
         BOSS_TOP - BOSS_BOT - THREAD_RELIEF - 0.5
     )
